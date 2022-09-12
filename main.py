@@ -5,13 +5,15 @@ import msal
 import requests
 import os
 import time
-
+import subprocess
 from zipfile import ZipFile
-
 import xml.etree.ElementTree as ElementTree
 
-from secrets import ADDITIONAL_APP_PROPERTIES, APP_ID, APP_NAME, APP_SECRET, INTUNEWIN_DIR, TENANT
+from azure.identity import ClientSecretCredential
+import azure.storage.blob
+import urllib.parse
 
+from secrets import ADDITIONAL_APP_PROPERTIES, APP_ID, APP_NAME, APP_SECRET, INTUNEWIN_DIR, TENANT
 
 class appIDIsEmptyStr(Exception):
     def __init__(self):
@@ -28,6 +30,29 @@ class tenantIsEmptyStr(Exception):
         self.message = f"tenant cannot be empty string"
         super().__init__(self.message)
 
+def run_live(command):
+  """
+  Run a subprocess with real-time output.
+  Can optionally redirect stdout/stderr to a log file.
+  Returns only the return-code.
+  """
+  # Validate that command is not a string
+  if isinstance(command, str):
+    # Not an array!
+    raise TypeError('Command must be an array')
+  # Run the command
+  logging.info(command)
+  if not command:
+    exit(1)
+  proc = subprocess.Popen(command,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT)
+  while proc.poll() is None:
+    l = proc.stdout.readline()
+    logging.info(l),
+  logging.info(proc.stdout.read())
+  return proc.returncode
+
 # update_non_existing_inplace will add the to_add to original_dict if they don't exist. will not override
 def update_non_existing_inplace(original_dict, to_add) -> dict:
     new = original_dict
@@ -36,7 +61,7 @@ def update_non_existing_inplace(original_dict, to_add) -> dict:
             new[key] = to_add[key]
     return new
 
-# extract_intune_win_portal will extract 
+# extract_intune_win_portal will extract the .portal.intunewin which is just a zip file
 def extract_intune_win_portal(intunewin_dir: str, app_name: str):
     with ZipFile(f"{intunewin_dir}//{app_name}.portal.intunewin", 'r') as f:
         #extract in different directory
@@ -52,6 +77,20 @@ def parse_detection_xml(intunewin_dir: str, app_name: str) -> dict:
         "name": tree.find("FileName").text,
         "size": int(tree.find("UnencryptedContentSize").text),
         "sizeEncrypted": os.path.getsize(f"{intunewin_dir}/{app_name}.intunewin")
+    }
+
+# borrowed from https://github.com/rahulbagal/upload-file-azure-sas-url/blob/master/azure_sas_upload.py
+def parse_storage_sas_url(sas_url):
+    o = urllib.parse.urlparse(sas_url)
+    # Remove first / from path
+    if o.path[0] == '/':
+        container_name = o.path[1:]
+    else:
+        container_name = o.path
+    storage_account = o.scheme + "://" + o.netloc + "/"
+    return {
+        "container_name": container_name, 
+        "storage_account": storage_account
     }
 
 class graphClient:
@@ -88,13 +127,18 @@ class graphClient:
             self.token = app.acquire_token_for_client(scopes=self.scopes)
         self.headers = {'Authorization': 'Bearer ' + self.token['access_token']}
 
+        token_credential = ClientSecretCredential(
+            self.tenant,
+            self.appID,
+            self.appSecret
+        )
     def get(self, endpoint):
         dest = self.baseURI.format(v=self.apiVersion, e=endpoint)
         return requests.get(dest, headers=self.headers).json()
 
     def post(self, endpoint, body):
         dest = self.baseURI.format(v=self.apiVersion, e=endpoint)
-        print(dest)
+        logging.info("POST", dest)
         headers = self.headers
         headers['Content-type'] = "application/json"
         return requests.post(dest, json=body, headers=headers).json()
@@ -111,9 +155,19 @@ class graphClient:
         headers["Content-Type"] = "application/json"
         return requests.delete(dest, headers=headers)
 
+    def upload_app(self, intunewin_dir, app_name, azure_storage_uri, azcopy_path="/usr/local/bin/azcopy"):
+        # shell out to azcopy for now
+        cmd = [azcopy_path]
+        args = ["cp", f"{intunewin_dir}/IntuneWinPackage/Contents/IntunePackage.intunewin", azure_storage_uri, "--block-size-mb", "4", "--output-type 'json'"]
+        cmd.extend(args)
+        rc = run_live(cmd)
+        if rc != 0:
+            return rc
+
+        # TODO(discentem): post content info to signal app upload is complete
+
     def delete_app(self, app_id):
         return self.delete(f"/deviceAppManagement/mobileApps/{app_id}")
-
 
     def list_intune_apps(self, only="#microsoft.graph.win32LobApp") -> list:
         apps = []
@@ -136,13 +190,17 @@ class graphClient:
         uri = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files" 
         content_req_resp = self.post(uri, size_info)
         print(content_req_resp)
+        # TODO(discentem): use proper retry library
         for i in range(5):
             uc = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files/{content_req_resp['id']}"
             print(uc)
             uri_check = self.get(uc)
             if "azureStorageUri" in uri_check:
+                # if uri we need is available, stop polling
                 break
             time.sleep(5)
+        # return uri for upload
+        # TODO(discentem): return entire content response as we need it to signal upload is complete
         return uri_check["azureStorageUri"]
 
     # huge shoutout to https://www.cyberdrain.com/automating-with-powershell-automatically-uploading-applications-to-intune-tenants/
@@ -175,8 +233,8 @@ class graphClient:
                 "sizeEncrypted": 3423
             }
             '''
-            # this doesn't upload yet, but now we get the uri of where we should upload to
-            return self.get_app_upload_uri(size_info, post_new_app['id']) 
+            azure_uri = self.get_app_upload_uri(size_info, post_new_app['id']) 
+            return self.upload_app(intunewin_dir, app_name, azure_uri)
 
 def main():
     # remove timestamps
