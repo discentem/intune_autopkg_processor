@@ -70,13 +70,36 @@ def extract_intune_win_portal(intunewin_dir: str, app_name: str):
         except Exception as e:
             raise e
 
+
+'''
+        $EncBody = @{
+        fileEncryptionInfo = @{
+            encryptionKey        = $intunexml.ApplicationInfo.EncryptionInfo.EncryptionKey
+            macKey               = $intunexml.ApplicationInfo.EncryptionInfo.MacKey
+            initializationVector = $intunexml.ApplicationInfo.EncryptionInfo.InitializationVector
+            mac                  = $intunexml.ApplicationInfo.EncryptionInfo.Mac
+            profileIdentifier    = $intunexml.ApplicationInfo.EncryptionInfo.ProfileIdentifier
+            fileDigest           = $intunexml.ApplicationInfo.EncryptionInfo.FileDigest
+            fileDigestAlgorithm  = $intunexml.ApplicationInfo.EncryptionInfo.FileDigestAlgorithm
+        }
+        '''
+
 def parse_detection_xml(intunewin_dir: str, app_name: str) -> dict:
     extract_intune_win_portal(intunewin_dir, app_name=app_name)
     tree = ElementTree.parse(f"{intunewin_dir}/IntuneWinPackage/Metadata/Detection.xml")
+    encryption_info = tree.find("EncryptionInfo")
     return {
         "name": tree.find("FileName").text,
         "size": int(tree.find("UnencryptedContentSize").text),
-        "sizeEncrypted": os.path.getsize(f"{intunewin_dir}/{app_name}.intunewin")
+        "sizeEncrypted": os.path.getsize(f"{intunewin_dir}/{app_name}.intunewin"),
+        # used for updating content metadata
+        "encryptionKey": encryption_info.find("EncryptionKey").text,
+        "macKey": encryption_info.find("MacKey").text,
+        "initializationVector": encryption_info.find("InitializationVector").text,
+        "mac": encryption_info.find("Mac").text,
+        "profileIdentifier": encryption_info.find("ProfileIdentifier").text,
+        "fileDigest": encryption_info.find("FileDigest").text,
+        "fileDigestAlgorithm": encryption_info.find("FileDigestAlgorithm").text
     }
 
 # borrowed from https://github.com/rahulbagal/upload-file-azure-sas-url/blob/master/azure_sas_upload.py
@@ -132,16 +155,24 @@ class graphClient:
             self.appID,
             self.appSecret
         )
-    def get(self, endpoint):
+    def get(self, endpoint, content_type=""):
         dest = self.baseURI.format(v=self.apiVersion, e=endpoint)
-        return requests.get(dest, headers=self.headers).json()
+        headers = self.headers
+        if content_type != "":
+            headers['Content-type'] = content_type
+        return requests.get(dest, headers=headers).json()
 
     def post(self, endpoint, body):
         dest = self.baseURI.format(v=self.apiVersion, e=endpoint)
-        logging.info("POST", dest)
+        # logging.info("POST", dest)
         headers = self.headers
         headers['Content-type'] = "application/json"
-        return requests.post(dest, json=body, headers=headers).json()
+        p = requests.post(dest, json=body, headers=headers)
+        try:
+            print(p.json())
+            return p.json()
+        except:
+            print(p)
 
     def patch(self, endpoint, body):
         dest = self.baseURI.format(v=self.apiVersion, e=endpoint)
@@ -155,14 +186,55 @@ class graphClient:
         headers["Content-Type"] = "application/json"
         return requests.delete(dest, headers=headers)
 
-    def upload_app(self, intunewin_dir, app_name, azure_storage_uri, azcopy_path="/usr/local/bin/azcopy"):
+    def upload_app(self, intunewin_dir, app_name, app_content, entry_id, file_encryption_info, azure_storage_uri, original_entry, azcopy_path="/usr/local/bin/azcopy"):
         # shell out to azcopy for now
         cmd = [azcopy_path]
-        args = ["cp", f"{intunewin_dir}/IntuneWinPackage/Contents/IntunePackage.intunewin", azure_storage_uri, "--block-size-mb", "4", "--output-type 'json'"]
+        args = ["cp", f"{intunewin_dir}/IntuneWinPackage/Contents/IntunePackage.intunewin", azure_storage_uri, "--block-size-mb", "1"] #"--output-type", "'json'"]
         cmd.extend(args)
         rc = run_live(cmd)
         if rc != 0:
             return rc
+
+
+        commit_uri = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files/{app_content['id']}/commit"
+        '''
+        file_encryption_info = {
+            "encryptionKey": "",
+            "macKey": "",
+            "initializationVector": "",
+            "mac": "",
+            "profileIdentifier": "",
+            "fileDigest": "",
+            "fileDigestAlgorithm": ""
+        }
+        '''
+        logging.info("file_encryption info:\n")
+        logging.info(file_encryption_info)
+        commit_req = self.post(commit_uri, file_encryption_info)
+        print(commit_req)
+        logging.info(f"Waiting for commit results for {app_name}")
+
+        for i in range(5):
+            uri = f"/deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files/{app_content['id']}"
+            commit_state = self.get(uri, content_type="application/json")
+            print(commit_state)
+            wait_statuses = ["commitFilePending", "azureStorageUriRequestSuccess", "commitFileFailed"]
+            if "fail" in commit_state['uploadState'] or commit_state['uploadState'] in wait_statuses:
+                logging.info("commit still pending... trying again in 5 seconds")
+                time.sleep(5)
+                continue
+
+            logging.info("metadata was committed successfully")
+            break
+        
+        commit_finalize = self.patch(f"/deviceAppManagement/mobileApps/{entry_id}", {
+            "@odata.type": "#microsoft.graph.win32lobapp",
+            "committedContentVerison": "1",
+        })
+        logging.info(commit_finalize)
+        logging.info(f"{app_name} is ready for assignment")
+
+        return 0
 
         # TODO(discentem): post content info to signal app upload is complete
 
@@ -186,21 +258,19 @@ class graphClient:
             new_entry["displayName"] == app["displayName"]
         )
 
-    def get_app_upload_uri(self, size_info: dict, entry_id) -> str:
-        uri = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files" 
-        content_req_resp = self.post(uri, size_info)
-        print(content_req_resp)
+    def get_app_content(self, size_info: dict, entry_id) -> dict:
+        return self.post(f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files", size_info)
+
+    def get_app_upload_uri(self, app_content, entry_id) -> str:
         # TODO(discentem): use proper retry library
         for i in range(5):
-            uc = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files/{content_req_resp['id']}"
+            uc = f"deviceAppManagement/mobileApps/{entry_id}/microsoft.graph.win32lobapp/contentVersions/1/files/{app_content['id']}"
             print(uc)
             uri_check = self.get(uc)
-            if "azureStorageUri" in uri_check:
-                # if uri we need is available, stop polling
-                break
-            time.sleep(5)
-        # return uri for upload
-        # TODO(discentem): return entire content response as we need it to signal upload is complete
+            if uri_check['azureStorageUri'] == None or uri_check['uploadState'] != "azureStorageUriRequestPending":
+                time.sleep(5)
+                print(uri_check)
+                continue
         return uri_check["azureStorageUri"]
 
     # huge shoutout to https://www.cyberdrain.com/automating-with-powershell-automatically-uploading-applications-to-intune-tenants/
@@ -216,7 +286,8 @@ class graphClient:
             # additional_properties supports any type that can be automatically parsed by json.dumps()
             new_entry = update_non_existing_inplace(new_entry, additional_properties)
 
-            size_info = parse_detection_xml(intunewin_dir, app_name=app_name)
+            detection_xml = parse_detection_xml(intunewin_dir, app_name=app_name)
+            print(detection_xml)
             
             existing_apps = self.list_intune_apps()
             for app in existing_apps:
@@ -233,8 +304,33 @@ class graphClient:
                 "sizeEncrypted": 3423
             }
             '''
-            azure_uri = self.get_app_upload_uri(size_info, post_new_app['id']) 
-            return self.upload_app(intunewin_dir, app_name, azure_uri)
+            entry_id = post_new_app['id']
+            app_content = self.get_app_content({
+                "name": detection_xml["name"],
+                "size": detection_xml["size"],
+                "sizeEncrypted": detection_xml["sizeEncrypted"]
+            }, entry_id)
+            print(app_content)
+            azure_uri = self.get_app_upload_uri(app_content, entry_id) 
+            return self.upload_app(
+                intunewin_dir, 
+                app_name, 
+                app_content, 
+                entry_id, 
+                {
+                    "fileEncryptionInfo": {
+                        "encryptionKey": detection_xml["encryptionKey"],
+                        "macKey": detection_xml["macKey"],
+                        "initializationVector": detection_xml["initializationVector"],
+                        "mac": detection_xml["mac"],
+                        "profileIdentifier": detection_xml["profileIdentifier"],
+                        "fileDigest": detection_xml["fileDigest"],
+                        "fileDigestAlgorithm": detection_xml["fileDigestAlgorithm"]
+                    }
+                }, 
+                azure_uri,
+                new_entry
+            )
 
 def main():
     # remove timestamps
