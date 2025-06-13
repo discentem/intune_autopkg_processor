@@ -229,7 +229,7 @@ class graphClient:
         
         commit_finalize = self.patch(f"/deviceAppManagement/mobileApps/{entry_id}", {
             "@odata.type": "#microsoft.graph.win32lobapp",
-            "committedContentVerison": "1",
+            "committedContentVersion": "1",
         })
         logging.info(commit_finalize)
         logging.info(f"{app_name} is ready for assignment")
